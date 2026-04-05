@@ -7,6 +7,25 @@ import Tokenizers
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma4
 
+// MARK: - Dtype-safe helpers (avoid float32 contamination in bfloat16 graphs)
+// See: https://github.com/ml-explore/mlx-swift-lm/pull/188
+
+/// GELU approximate that preserves input dtype (framework gemma4Gelu uses float32 literals)
+private let gemma4Gelu: @Sendable (MLXArray) -> MLXArray = {
+    compile(shapeless: true) { (x: MLXArray) -> MLXArray in
+        let half = MLXArray(0.5, dtype: x.dtype)
+        let coeff = MLXArray(0.044715, dtype: x.dtype)
+        let sqrtTwoPi = MLXArray(sqrt(2.0 / Float.pi), dtype: x.dtype)
+        return half * x * (1 + tanh(sqrtTwoPi * (x + coeff * x ** 3)))
+    }
+}()
+
+/// Logit softcapping that preserves input dtype
+private func logitSoftcap(_ x: MLXArray, softcap: Float) -> MLXArray {
+    let sc = MLXArray(softcap, dtype: x.dtype)
+    return MLX.tanh(x / sc) * sc
+}
+
 private enum Gemma4Error: LocalizedError {
     case imageTokenCountMismatch(expectedVisionTokens: Int, actualPromptTokens: Int)
 
@@ -457,7 +476,7 @@ private final class Gemma4TextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4Gelu(gateProj(x)) * upProj(x))
     }
 }
 
@@ -517,7 +536,7 @@ private final class Gemma4TextExperts: Module {
             inputDims: config.hiddenSize,
             hiddenDims: moeIntermediateSize,
             numExperts: numExperts,
-            activation: geluApproximate,
+            activation: gemma4Gelu,
             bias: false
         )
         super.init()
@@ -796,7 +815,7 @@ private final class Gemma4TextDecoderLayer: Module {
         {
             residual = h
             var gated = perLayerInputGate(h)
-            gated = geluApproximate(gated)
+            gated = gemma4Gelu(gated)
             gated = gated * perLayerInput
             gated = perLayerProjection(gated)
             gated = postPerLayerInputNorm(gated)
@@ -882,7 +901,7 @@ private final class Gemma4TextBackbone: Module {
                 inputIds .>= 0, inputIds .< config.vocabularySizePerLayerInput)
         let tokens = MLX.where(validMask, inputIds, MLXArray.zeros(like: inputIds))
         var result = embedTokensPerLayer(tokens)
-        result = (result * MLXArray(embedTokensPerLayerScale, dtype: .float32)).asType(result.dtype)
+        result = result * MLXArray(embedTokensPerLayerScale, dtype: result.dtype)
         return result.reshaped(
             Array(inputIds.shape) + [config.hiddenLayers, config.hiddenSizePerLayerInput]
         )
@@ -923,7 +942,7 @@ private final class Gemma4TextBackbone: Module {
             h0 = inputsEmbeds
         } else if let inputs {
             let embeddings = embedTokens(inputs)
-            h0 = (embeddings * MLXArray(embedScale, dtype: .float32)).asType(embeddings.dtype)
+            h0 = embeddings * MLXArray(embedScale, dtype: embeddings.dtype)
         } else {
             fatalError("Either inputs or inputsEmbeds must be provided")
         }
@@ -1042,8 +1061,7 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             logits = model.embedTokens.asLinear(output)
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
-            let scale = MLXArray(finalLogitSoftcapping)
-            return LMOutput(logits: tanh(logits / scale) * scale)
+            return LMOutput(logits: logitSoftcap(logits, softcap: finalLogitSoftcapping))
         }
         return LMOutput(logits: logits)
     }
@@ -1272,7 +1290,7 @@ private final class Gemma4VisionMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4Gelu(gateProj(x)) * upProj(x))
     }
 }
 
@@ -1573,9 +1591,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     ) throws -> (MLXArray, MLXArray?) {
         var inputsEmbeds = languageModel.model.embedTokens(inputIds)
         inputsEmbeds =
-            (inputsEmbeds
-            * MLXArray(pow(Float(config.textConfiguration.hiddenSize), 0.5), dtype: .float32))
-            .asType(inputsEmbeds.dtype)
+            inputsEmbeds
+            * MLXArray(pow(Float(config.textConfiguration.hiddenSize), 0.5), dtype: inputsEmbeds.dtype)
 
         var perLayerInputs: MLXArray? = nil
         if config.textConfiguration.hiddenSizePerLayerInput > 0 {
